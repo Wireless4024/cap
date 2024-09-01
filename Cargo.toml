@@ -22,7 +22,9 @@ azure-devops = { project = "alecmocatta/cap", pipeline = "tests" }
 maintenance = { status = "passively-maintained" }
 
 [features]
-nightly = []
+default = []
+nightly = ["allocator-api2?/nightly"]
 stats = []
 
 [dependencies]
+allocator-api2 = { version = "0.2", optional = true }

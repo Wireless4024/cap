@@ -47,7 +47,9 @@
 )]
 
 #[cfg(feature = "nightly")]
-use std::alloc::{Alloc, AllocErr, CannotReallocInPlace};
+use std::alloc::{AllocError, Allocator};
+#[cfg(all(not(feature = "nightly"), feature = "allocator-api2"))]
+use allocator_api2::alloc::{AllocError, Allocator};
 use std::{
 	alloc::{GlobalAlloc, Layout}, ptr, sync::atomic::{AtomicUsize, Ordering}
 };
@@ -249,17 +251,17 @@ where
 	}
 }
 
-#[cfg(feature = "nightly")]
-unsafe impl<H> Alloc for Cap<H>
+#[cfg(any(feature = "nightly", feature = "allocator-api2"))]
+unsafe impl<H> Allocator for Cap<H>
 where
-	H: Alloc,
+	H: Allocator,
 {
-	unsafe fn alloc(&mut self, l: Layout) -> Result<ptr::NonNull<u8>, AllocErr> {
-		let size = self.allocator.usable_size(&l).1;
+	fn allocate(&self, l: Layout) -> Result<ptr::NonNull<[u8]>, AllocError> {
+		let size = l.size();
 		let res = if self.remaining.fetch_sub(size, Ordering::Acquire) >= size {
-			self.allocator.alloc(l)
+			self.allocator.allocate(l)
 		} else {
-			Err(AllocErr)
+			Err(AllocError)
 		};
 		if res.is_err() {
 			let _ = self.remaining.fetch_add(size, Ordering::Release);
@@ -268,82 +270,64 @@ where
 		}
 		res
 	}
-	unsafe fn dealloc(&mut self, item: ptr::NonNull<u8>, l: Layout) {
-		let size = self.allocator.usable_size(&l).1;
-		self.allocator.dealloc(item, l);
+
+	fn allocate_zeroed(&self, l: Layout) -> Result<ptr::NonNull<[u8]>, AllocError> {
+		let size = l.size();
+		let res = if self.remaining.fetch_sub(size, Ordering::Acquire) >= size {
+			self.allocator.allocate_zeroed(l)
+		} else {
+			Err(AllocError)
+		};
+		if res.is_err() {
+			let _ = self.remaining.fetch_add(size, Ordering::Release);
+		} else {
+			self.update_stats(size);
+		}
+		res
+	}
+
+	unsafe fn deallocate(&self, item: ptr::NonNull<u8>, l: Layout) {
+		let size = l.size();
+		self.allocator.deallocate(item, l);
 		let _ = self.remaining.fetch_add(size, Ordering::Release);
 	}
-	fn usable_size(&self, layout: &Layout) -> (usize, usize) {
-		self.allocator.usable_size(layout)
-	}
-	unsafe fn realloc(
-		&mut self, ptr: ptr::NonNull<u8>, old_l: Layout, new_s: usize,
-	) -> Result<ptr::NonNull<u8>, AllocErr> {
-		let new_l = Layout::from_size_align_unchecked(new_s, old_l.align());
-		let (old_size, new_size) = (
-			self.allocator.usable_size(&old_l).1,
-			self.allocator.usable_size(&new_l).1,
-		);
-		let res = if new_size > old_size {
-			let res = if self
-				.remaining
-				.fetch_sub(new_size - old_size, Ordering::Acquire)
-				>= new_size - old_size
-			{
-				self.allocator.realloc(ptr, old_l, new_s)
-			} else {
-				Err(AllocErr)
-			};
-			if res.is_err() {
-				let _ = self
-					.remaining
-					.fetch_add(new_size - old_size, Ordering::Release);
-			}
-			res
+
+	unsafe fn grow(
+		&self, ptr: ptr::NonNull<u8>, old_l: Layout, new_l: Layout,
+	) -> Result<ptr::NonNull<[u8]>, AllocError> {
+		let additional = new_l.size() - old_l.size();
+		let res = if self
+			.remaining
+			.fetch_sub(additional, Ordering::Acquire)
+			>= additional
+		{
+			self.allocator.grow(ptr, old_l, new_l)
 		} else {
-			let res = self.allocator.realloc(ptr, old_l, new_s);
-			if res.is_ok() {
-				let _ = self
-					.remaining
-					.fetch_add(old_size - new_size, Ordering::Release);
-			}
-			res
-		};
-		if res.is_ok() {
-			self.update_stats(new_size);
-		}
-		res
-	}
-	unsafe fn alloc_zeroed(&mut self, l: Layout) -> Result<ptr::NonNull<u8>, AllocErr> {
-		let size = self.allocator.usable_size(&l).1;
-		let res = if self.remaining.fetch_sub(size, Ordering::Acquire) >= size {
-			self.allocator.alloc_zeroed(l)
-		} else {
-			Err(AllocErr)
+			Err(AllocError)
 		};
 		if res.is_err() {
-			let _ = self.remaining.fetch_add(size, Ordering::Release);
+			let _ = self
+				.remaining
+				.fetch_add(additional, Ordering::Release);
 		} else {
-			self.update_stats(size);
+			self.update_stats(additional);
 		}
 		res
 	}
-	unsafe fn grow_in_place(
-		&mut self, ptr: ptr::NonNull<u8>, old_l: Layout, new_s: usize,
-	) -> Result<(), CannotReallocInPlace> {
-		let new_l = Layout::from_size_align(new_s, old_l.align()).unwrap();
+
+	unsafe fn grow_zeroed(&self, ptr: ptr::NonNull<u8>, old_l: Layout, new_l: Layout) -> Result<ptr::NonNull<[u8]>, AllocError> {
 		let (old_size, new_size) = (
-			self.allocator.usable_size(&old_l).1,
-			self.allocator.usable_size(&new_l).1,
+			old_l.size(),
+			new_l.size(),
 		);
 		let res = if self
 			.remaining
 			.fetch_sub(new_size - old_size, Ordering::Acquire)
 			>= new_size - old_size
 		{
-			self.allocator.grow_in_place(ptr, old_l, new_s)
+			self.allocator.grow_zeroed(ptr, old_l, new_l)
 		} else {
-			Err(CannotReallocInPlace)
+			Err(AllocError)
 		};
 		if res.is_err() {
 			let _ = self
@@ -354,19 +338,16 @@ where
 		}
 		res
 	}
-	unsafe fn shrink_in_place(
-		&mut self, ptr: ptr::NonNull<u8>, old_l: Layout, new_s: usize,
-	) -> Result<(), CannotReallocInPlace> {
-		let new_l = Layout::from_size_align(new_s, old_l.align()).unwrap();
-		let (old_size, new_size) = (
-			self.allocator.usable_size(&old_l).1,
-			self.allocator.usable_size(&new_l).1,
-		);
-		let res = self.allocator.shrink_in_place(ptr, old_l, new_s);
+
+	unsafe fn shrink(
+		&self, ptr: ptr::NonNull<u8>, old_l: Layout, new_l: Layout,
+	) -> Result<ptr::NonNull<[u8]>, AllocError> {
+		let removed = old_l.size() - new_l.size();
+		let res = self.allocator.shrink(ptr, old_l, new_l);
 		if res.is_ok() {
 			let _ = self
 				.remaining
-				.fetch_add(old_size - new_size, Ordering::Release);
+				.fetch_add(removed, Ordering::Release);
 		}
 		res
 	}
@@ -374,13 +355,16 @@ where
 
 #[cfg(test)]
 mod tests {
+	#[cfg_attr(all(test, feature = "nightly"), feature(allocator_api))]
 	#[cfg(all(test, feature = "nightly"))]
 	extern crate test;
-	#[cfg(all(test, feature = "nightly"))]
+	#[cfg(all(test))]
 	use std::collections::TryReserveError;
 	use std::{alloc, thread};
 	#[cfg(all(test, feature = "nightly"))]
 	use test::{TestDescAndFn, TestFn};
+	#[cfg(all(test, not(feature = "nightly"), feature = "allocator-api2"))]
+	use allocator_api2::vec::Vec;
 
 	use super::Cap;
 
@@ -428,7 +412,7 @@ mod tests {
 		assert!(A.max_allocated() < A.total_allocated());
 	}
 
-	#[cfg(all(test, not(feature = "nightly")))]
+	#[cfg(all(test, not(any(feature = "nightly", feature = "allocator-api2"))))]
 	#[test]
 	fn limit() {
 		#[cfg(feature = "stats")]
@@ -437,8 +421,7 @@ mod tests {
 		A.set_limit(A.allocated() + allocate_amount).unwrap();
 		for _ in 0..10 {
 			let mut vec = Vec::<u8>::with_capacity(0);
-			if let Err(_e) = vec.try_reserve_exact(allocate_amount + 1) {
-			} else {
+			if let Err(_e) = vec.try_reserve_exact(allocate_amount + 1) {} else {
 				A.set_limit(usize::max_value()).unwrap();
 				panic!("{}", A.remaining());
 			};
@@ -454,25 +437,24 @@ mod tests {
 		}
 	}
 
-	#[cfg(all(test, feature = "nightly"))]
+	#[cfg(all(test, any(feature = "nightly", feature = "allocator-api2")))]
 	#[test]
 	fn limit() {
 		let allocate_amount = 30 * 1024 * 1024;
-		A.set_limit(A.allocated() + allocate_amount).unwrap();
+		let allocated = A.allocated();
+		A.set_limit(allocated + allocate_amount).unwrap();
 		for _ in 0..10 {
-			let mut vec = Vec::<u8>::with_capacity(0);
-			if let Err(TryReserveError::AllocError { .. }) =
-				vec.try_reserve_exact(allocate_amount + 1)
-			{
+			let mut vec = Vec::<u8, _>::with_capacity_in(0, &A);
+			if vec.try_reserve_exact(allocate_amount + 1).is_err() {
 			} else {
 				A.set_limit(usize::max_value()).unwrap();
 				panic!("{}", A.remaining())
 			};
 			assert_eq!(vec.try_reserve_exact(allocate_amount), Ok(()));
-			let mut vec2 = Vec::<u8>::with_capacity(0);
+			let mut vec2 = Vec::<u8, _>::with_capacity_in(0, &A);
 			assert!(vec2.try_reserve_exact(1).is_err());
 		}
-		assert_eq!(A.total_allocated(), 10 * allocate_amount);
-		assert_eq!(A.max_allocated(), allocate_amount)
+		assert_eq!(A.max_allocated(), allocate_amount + allocated);
+		assert!(A.total_allocated() >= allocated + (10 * allocate_amount));
 	}
 }
