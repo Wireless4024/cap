@@ -454,7 +454,10 @@ mod tests {
 			let mut vec2 = Vec::<u8, _>::with_capacity_in(0, &A);
 			assert!(vec2.try_reserve_exact(1).is_err());
 		}
-		assert_eq!(A.max_allocated(), allocate_amount + allocated);
-		assert!(A.total_allocated() >= allocated + (10 * allocate_amount));
+		#[cfg(feature = "stats")]
+		{
+			assert!(A.total_allocated() >= allocated + (10 * allocate_amount));
+			assert_eq!(A.max_allocated(), allocate_amount + allocated);
+		}
 	}
 }
